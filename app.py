@@ -12,21 +12,10 @@ from collections import deque
 import cv2 as cv
 import numpy as np
 import mediapipe as mp
-import subprocess
 
 from utils import CvFpsCalc
 from model import KeyPointClassifier
 from model import PointHistoryClassifier
-
-GESTURE_ACTIONS = {
-    "Open" : "Allumer",
-    "Close" : "Eteindre",
-    "OK" : "Selectionner",
-    "Up" : "Haut",
-    "Down" : "Bas",
-    "Left" : "Gauche",
-    "Right" : "Droite"
-}
 
 # Gesture action safety
 #
@@ -40,12 +29,25 @@ GESTURE_MIN_OCCURRENCES = 3          # Minimum occurrences in the history
 GESTURE_CONFIRMATION_DELAY = 0.30    # Candidate must remain stable for 300 ms
 GESTURE_COOLDOWN = 1.0               # Delay after an action before another one
 
-# Two-hand safety system
-#
-# The LEFT hand must continuously perform the "OK" gesture to authorize
-# actions from the RIGHT hand. As soon as the left hand is no longer
-# recognized as OK, right-hand actions are ignored.
-AUTHORIZATION_GESTURE = "OK"
+POINT_HISTORY_LENGTH = 16
+
+class HandState:
+    def __init__(self):
+        # History used to validate the detected gesture
+        self.gesture_history = deque(maxlen=GESTURE_HISTORY_LENGTH)
+
+        # History used by the finger gesture classifier
+        self.finger_gesture_history = deque(maxlen=POINT_HISTORY_LENGTH)
+
+        # Point trajectory history
+        self.point_history = deque(maxlen=POINT_HISTORY_LENGTH)
+
+        # Gesture sampling
+        self.last_sample_time = 0.0
+
+        # Gesture confirmation
+        self.candidate_gesture = None
+        self.candidate_since = 0.0
 
 # VIDAA configuration
 # Replace these values with your TV network information.
@@ -79,54 +81,59 @@ def get_args():
     return args
 
 
-def execute_vidaa_action(gesture):
-    """Execute a validated gesture through the vidaa-control CLI."""
-    if gesture == "Open":
-        command = ["tv", "--ip", VIDAA_TV_IP, "on"]
-    elif gesture == "Close":
-        command = ["tv", "--ip", VIDAA_TV_IP, "off"]
-    else:
-        key_mapping = {
-            "OK": "OK",
-            "Up": "UP",
-            "Down": "DOWN",
-            "Left": "LEFT",
-            "Right": "RIGHT",
-        }
-        key = key_mapping.get(gesture)
-        if key is None:
-            print(f"Geste VIDAA inconnu : {gesture}")
-            return False
-        command = ["tv", "--ip", VIDAA_TV_IP, "key", key]
-
+def execute_vidaa_action(action):
+    ACTION_TO_COMMAND = {
+        "Neutral": "No command",
+        "Power": tv.power,
+        "Ok": tv.ok,
+        "Left": tv.left,
+        "Right": tv.right,
+        "Up": tv.up,
+        "Down": tv.down,
+    }
     try:
-        result = subprocess.run(
-            command,
-            capture_output=True,
-            text=True,
-            timeout=10,
-        )
-
-        if result.returncode == 0:
-            return True
-
-        error = result.stderr.strip() or result.stdout.strip()
-        print(f"Erreur VIDAA ({gesture}) : {error}")
-        return False
-
-    except subprocess.TimeoutExpired:
-        print(f"Timeout lors de l'envoi de l'action VIDAA : {gesture}")
-        return False
+        command = ACTION_TO_COMMAND.get(action)
+        if command is None:
+            print(f"Action inconnue : {action}")
+            return False
+        command()
+        return True
     except FileNotFoundError:
         print("Erreur VIDAA : la commande 'tv' est introuvable.")
         return False
     except Exception as exc:
-        print(f"Erreur VIDAA ({gesture}) : {exc}")
+        print(f"Erreur VIDAA ({action}) : {exc}")
         return False
+
+def translate_gesture_to_action(hand_label, hand_gesture, finger_gesture):
+    RIGHT_HAND_GESTURE_TO_ACTION = {
+        "Open" : "Power",
+        "Close" : "Neutral",
+        "Pointer" : "Selection",
+        "Ok" : "Ok",
+        "Stop" : "Neutral",
+        "Left" : "Left",
+        "Right" : "Right",
+        "Up" : "Up",
+        "Down" : "Down",
+    }
+    LEFT_HAND_GESTURE_TO_ACTION = {
+        "Open" : "Power",
+        "Close" : "Neutral",
+        "Pointer" : "Selection",
+        "Ok" : "Ok",
+    }
+    if hand_label == "right":
+        action_detected = RIGHT_HAND_GESTURE_TO_ACTION.get(hand_gesture, "Neutral")
+        if action_detected == "Selection":
+            return RIGHT_HAND_GESTURE_TO_ACTION.get(finger_gesture, "Neutral")
+    else:
+        action_detected = LEFT_HAND_GESTURE_TO_ACTION.get(hand_gesture, "Neutral")
+    return action_detected
 
 
 def main():
-    # Argument parsing #################################################################
+    # Argument parsing
     args = get_args()
 
     cap_device = args.device
@@ -139,12 +146,12 @@ def main():
 
     use_brect = True
 
-    # Camera preparation ###############################################################
+    # Camera preparation
     cap = cv.VideoCapture(cap_device)
     cap.set(cv.CAP_PROP_FRAME_WIDTH, cap_width)
     cap.set(cv.CAP_PROP_FRAME_HEIGHT, cap_height)
 
-    # MediaPipe Hand Landmarker initialization ###############################
+    # MediaPipe Hand Landmarker initialization
     # MediaPipe 1.x uses the Tasks API instead of the old mp.solutions API.
     model_path = args.model
     if not os.path.isfile(model_path):
@@ -172,7 +179,7 @@ def main():
 
     point_history_classifier = PointHistoryClassifier()
 
-    # Read labels ###########################################################
+    # Read keypoint labels
     with open('model/keypoint_classifier/keypoint_classifier_label.csv',
               encoding='utf-8-sig') as f:
         keypoint_classifier_labels = csv.reader(f)
@@ -187,39 +194,18 @@ def main():
             row[0] for row in point_history_classifier_labels
         ]
 
-    # FPS Measurement ########################################################
+    # FPS Measurement
     cvFpsCalc = CvFpsCalc(buffer_len=10)
 
-    # Coordinate history #################################################################
-    history_length = 16
-    point_history = deque(maxlen=history_length)
+    # Hands declarations
+    hand_states = {
+        "left": HandState(),
+        "right": HandState(),
+    }
 
-    # Finger gesture history ################################################
-    finger_gesture_history = deque(maxlen=history_length)
-
-    # Gesture action validation history ######################################
-    # This history is deliberately sampled much more slowly than the camera
-    # FPS. This prevents the beginning of a hand movement from filling the
-    # history with dozens of transient predictions in a few milliseconds.
-    gesture_action_history = deque(maxlen=GESTURE_HISTORY_LENGTH)
-
-    # Left-hand authorization history.
-    authorization_history = deque(maxlen=GESTURE_HISTORY_LENGTH)
-
-    last_gesture_sample_time = 0.0
-    last_authorization_sample_time = 0.0
     last_action_time = 0.0
 
-    candidate_gesture = None
-    candidate_since = 0.0
-
-    # True only while the left hand is continuously recognized as OK.
-    detection_enabled = False
-
-    # Text displayed on screen for the last triggered action.
-    action_text = ""
-
-    #  ########################################################################
+    # Mode used (0 = normal, 1 = keypoint log, 2 = point history log)
     mode = 0
 
     # VIDEO mode is synchronous and uses MediaPipe tracking between frames.
@@ -229,13 +215,13 @@ def main():
         while True:
             fps = cvFpsCalc.get()
 
-            # Process Key (ESC: end) #################################################
+            # Process Key (ESC: end)
             key = cv.waitKey(10)
             if key == 27:  # ESC
                 break
             number, mode = select_mode(key, mode)
 
-            # Camera capture #####################################################
+            # Camera capture 
             ret, image = cap.read()
             if not ret:
                 break
@@ -254,129 +240,37 @@ def main():
                 timestamp_ms + 1,
                 int(time.monotonic() * 1000),
             )
+            current_time = time.monotonic()
             results = hands.detect_for_video(mp_image, timestamp_ms)
 
             if results.hand_landmarks:
-                # -------------------------------------------------------------
-                # Identify the left and right hands.
-                #
-                # MediaPipe provides one handedness result for each detected
-                # hand. We keep the two hands separate so that:
-                #
-                #   LEFT  hand = authorization ("OK")
-                #   RIGHT hand = TV command
-                # -------------------------------------------------------------
-                left_hand_data = None
-                right_hand_data = None
-
                 for hand_landmarks, handedness in zip(
                     results.hand_landmarks,
                     results.handedness,
                 ):
-                    handedness_label = get_handedness_label(handedness).lower()
+                    # Get the current hand
+                    hand_label = get_handedness_label(handedness)
+                    hand_state = hand_states.get(hand_label)
 
-                    # L'image est une image miroir, il faut donc retourner les cases
-                    if handedness_label == "right":
-                        left_hand_data = (hand_landmarks, handedness)
-                    elif handedness_label == "left":
-                        right_hand_data = (hand_landmarks, handedness)
-
-                current_time = time.monotonic()
-
-                # =============================================================
-                # LEFT HAND: AUTHORIZATION
-                # =============================================================
-                if left_hand_data is not None:
-                    left_landmarks, left_handedness = left_hand_data
-
-                    left_landmark_list = calc_landmark_list(
-                        debug_image, left_landmarks
-                    )
-                    left_pre_processed_landmark_list = pre_process_landmark(
-                        left_landmark_list
-                    )
-
-                    # The logging system must work for BOTH hands.
-                    # The left hand is used for static gesture training, so we
-                    # record its keypoints without involving authorization.
-                    if mode == 1:
-                        logging_csv(
-                            number,
-                            mode,
-                            left_pre_processed_landmark_list,
-                            [],
-                        )
-
-                    left_hand_sign_id = keypoint_classifier(
-                        left_pre_processed_landmark_list
-                    )
-                    left_gesture = keypoint_classifier_labels[
-                        left_hand_sign_id
-                    ]
-
-                    # Sample the left-hand prediction at the same temporal
-                    # rate as the right-hand action history.
-                    if (
-                        current_time - last_authorization_sample_time
-                        >= GESTURE_SAMPLE_INTERVAL
-                    ):
-                        authorization_history.append(left_gesture)
-                        last_authorization_sample_time = current_time
-
-                    # Authorization is active only while the recent history
-                    # confirms OK.
-                    if len(authorization_history) == GESTURE_HISTORY_LENGTH:
-                        authorization_counts = Counter(
-                            authorization_history
-                        )
-                        authorization_gesture, occurrences = (
-                            authorization_counts.most_common(1)[0]
-                        )
-
-                        detection_enabled = (
-                            authorization_gesture == AUTHORIZATION_GESTURE
-                            and occurrences >= GESTURE_MIN_OCCURRENCES
-                        )
-                    else:
-                        detection_enabled = False
-
-                    # Draw the left-hand bounding box and landmarks.
-                    left_brect = calc_bounding_rect(
-                        debug_image, left_landmarks
-                    )
-                    debug_image = draw_bounding_rect(
-                        use_brect, debug_image, left_brect
-                    )
-                    debug_image = draw_landmarks(
-                        debug_image, left_landmark_list
-                    )
-
-                else:
-                    # No left hand = no authorization.
-                    authorization_history.clear()
-                    detection_enabled = False
-                    last_authorization_sample_time = current_time
-
-                # =============================================================
-                # RIGHT HAND: TV COMMAND
-                # =============================================================
-                if right_hand_data is not None:
-                    right_landmarks, right_handedness = right_hand_data
-
+                    if hand_state is None:
+                        continue
+                    
                     brect = calc_bounding_rect(
-                        debug_image, right_landmarks
-                    )
-                    landmark_list = calc_landmark_list(
-                        debug_image, right_landmarks
+                        debug_image, hand_landmarks
                     )
 
+                    # Processing
+                    landmark_list = calc_landmark_list(
+                        debug_image, hand_landmarks
+                    )
                     pre_processed_landmark_list = pre_process_landmark(
                         landmark_list
                     )
                     pre_processed_point_history_list = pre_process_point_history(
-                        debug_image, point_history
+                        debug_image, hand_state.point_history
                     )
 
+                    # Log (if logging mode is selected)
                     logging_csv(
                         number,
                         mode,
@@ -390,152 +284,91 @@ def main():
                     current_gesture = keypoint_classifier_labels[hand_sign_id]
 
                     if hand_sign_id == 2:
-                        point_history.append(landmark_list[8])
+                        hand_state.point_history.append(landmark_list[8])
                     else:
-                        point_history.append([0, 0])
+                        hand_state.point_history.append([0, 0])
 
+                    # Finger gesture classification
                     finger_gesture_id = 0
-                    point_history_len = len(pre_processed_point_history_list)
-                    if point_history_len == (history_length * 2):
+                    
+                    if len(pre_processed_point_history_list) == (POINT_HISTORY_LENGTH * 2):
                         finger_gesture_id = point_history_classifier(
                             pre_processed_point_history_list
                         )
 
-                    finger_gesture_history.append(finger_gesture_id)
+                    # Calculates the gesture IDs in the latest detection
+                    hand_state.finger_gesture_history.append(finger_gesture_id)
+                    
                     most_common_fg_id = Counter(
-                        finger_gesture_history
+                        hand_state.finger_gesture_history
                     ).most_common()
 
-                    # ---------------------------------------------------------
-                    # ACTION SAFETY
-                    #
-                    # The right-hand gesture history is only filled while the
-                    # left hand authorizes the system.
-                    # ---------------------------------------------------------
-                    if detection_enabled:
-                        if (
-                            current_time - last_gesture_sample_time
-                            >= GESTURE_SAMPLE_INTERVAL
-                        ):
-                            gesture_action_history.append(current_gesture)
-                            last_gesture_sample_time = current_time
+                    # Drawing part
+                    debug_image = draw_bounding_rect(use_brect, debug_image, brect)
+                    debug_image = draw_landmarks(debug_image, landmark_list)
+                    debug_image = draw_info_text(
+                        debug_image,
+                        brect,
+                        get_handedness_label(handedness),
+                        keypoint_classifier_labels[hand_sign_id],
+                        point_history_classifier_labels[most_common_fg_id[0][0]],
+                    )
+
+                    if (
+                        current_time - hand_state.last_sample_time
+                        >= GESTURE_SAMPLE_INTERVAL
+                    ):
+                        hand_state.gesture_history.append(current_gesture)
+                        hand_state.last_sample_time = current_time
 
                         # Once the history is full, look for a majority gesture.
-                        if len(gesture_action_history) == GESTURE_HISTORY_LENGTH:
-                            gesture_counts = Counter(gesture_action_history)
-                            candidate, occurrences = (
-                                gesture_counts.most_common(1)[0]
-                            )
+                        if len(hand_state.gesture_history) == GESTURE_HISTORY_LENGTH:
+                            gesture_counts = Counter(hand_state.gesture_history)
+                            candidate, occurrences = gesture_counts.most_common(1)[0]
 
-                            if (
-                                candidate in GESTURE_ACTIONS
-                                and candidate != AUTHORIZATION_GESTURE
-                                and occurrences >= GESTURE_MIN_OCCURRENCES
-                            ):
+                            if occurrences >= GESTURE_MIN_OCCURRENCES:
                                 # A new candidate starts its own confirmation
                                 # period. We do NOT trigger the action immediately.
-                                if candidate_gesture != candidate:
-                                    candidate_gesture = candidate
-                                    candidate_since = current_time
+                                if hand_state.candidate_gesture != candidate:
+                                    hand_state.candidate_gesture = candidate
+                                    hand_state.candidate_since = current_time
 
                                 # The candidate must remain stable for the
                                 # confirmation delay before executing VIDAА.
                                 elif (
-                                    current_time - candidate_since
+                                    current_time - hand_state.candidate_since
                                     >= GESTURE_CONFIRMATION_DELAY
                                     and current_time - last_action_time
                                     >= GESTURE_COOLDOWN
                                 ):
-                                    action_text = GESTURE_ACTIONS[candidate]
+                                    action = translate_gesture_to_action(
+                                        hand_label,
+                                        candidate,
+                                        point_history_classifier_labels[most_common_fg_id[0][0]]
+                                    )
 
                                     # Send the command only after every safety check.
-                                    if execute_vidaa_action(candidate):
+                                    if execute_vidaa_action(action):
                                         print(
-                                            f"Action VIDAA exécutée : {action_text}"
+                                            f"Action VIDAA exécutée : {action}"
                                         )
                                     else:
                                         print(
-                                            f"Échec de l'action VIDAA : {action_text}"
+                                            f"Échec de l'action VIDAA : {action}"
                                         )
-
-                                    last_action_time = current_time
 
                                     # Prevent the same history from triggering
                                     # another action immediately.
-                                    gesture_action_history.clear()
-                                    candidate_gesture = None
-                                    candidate_since = 0.0
-                    else:
-                        # The authorization was removed, so all pending right
-                        # hand information must be discarded.
-                        gesture_action_history.clear()
-                        candidate_gesture = None
-                        candidate_since = 0.0
-                        last_gesture_sample_time = current_time
-
-                    # Draw the right-hand bounding box and landmarks.
-                    debug_image = draw_bounding_rect(
-                        use_brect, debug_image, brect
-                    )
-                    debug_image = draw_landmarks(
-                        debug_image, landmark_list
-                    )
-
-                    # Display whether the two-hand safety system is active.
-                    authorization_text = (
-                        "AUTORISE" if detection_enabled else "VERROUILLE"
-                    )
-
-                    debug_image = draw_info_text(
-                        debug_image,
-                        brect,
-                        keypoint_classifier_labels[hand_sign_id],
-                        point_history_classifier_labels[
-                            most_common_fg_id[0][0]
-                        ],
-                        action_text,
-                    )
-
-                    cv.putText(
-                        debug_image,
-                        "Controle : " + authorization_text,
-                        (10, 140),
-                        cv.FONT_HERSHEY_SIMPLEX,
-                        0.8,
-                        (0, 0, 0),
-                        4,
-                        cv.LINE_AA,
-                    )
-                    cv.putText(
-                        debug_image,
-                        "Controle : " + authorization_text,
-                        (10, 140),
-                        cv.FONT_HERSHEY_SIMPLEX,
-                        0.8,
-                        (255, 255, 255),
-                        2,
-                        cv.LINE_AA,
-                    )
-
-                else:
-                    # No right hand: there is no command to process.
-                    point_history.append([0, 0])
-
-                    gesture_action_history.clear()
-                    candidate_gesture = None
-                    candidate_since = 0.0
-                    last_gesture_sample_time = current_time
-
+                                    hand_state.gesture_history.clear()
+                                    hand_state.candidate_gesture = None
+                                    hand_state.candidate_since = 0.0
+                
             else:
-                # No hands detected: everything is locked.
-                point_history.append([0, 0])
-                authorization_history.clear()
-                gesture_action_history.clear()
-
-                detection_enabled = False
-                candidate_gesture = None
-                candidate_since = 0.0
-
+                # Reset values if no hands are detected
+                for hand_state in hand_states.values():
+                    hand_state.gesture_history.clear()
+                    hand_state.candidate_gesture = None
+                    hand_state.candidate_since = 0.0
                 current_time = time.monotonic()
                 last_authorization_sample_time = current_time
                 last_gesture_sample_time = current_time
@@ -562,12 +395,12 @@ def select_mode(key, mode):
     return number, mode
 
 
-def draw_info_text(image, brect, hand_sign_text,
-                   finger_gesture_text, action_text):
+def draw_info_text(image, brect, hand_label, hand_sign_text,
+                   finger_gesture_text):
     cv.rectangle(image, (brect[0], brect[1]), (brect[2], brect[1] - 22),
                  (0, 0, 0), -1)
 
-    info_text = "Right"
+    info_text = hand_label
     if hand_sign_text != "":
         info_text = info_text + ' : ' + hand_sign_text
     cv.putText(image, info_text, (brect[0] + 5, brect[1] - 4),
@@ -577,13 +410,6 @@ def draw_info_text(image, brect, hand_sign_text,
         cv.putText(image, "Finger Gesture : " + finger_gesture_text, (10, 60),
                    cv.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4, cv.LINE_AA)
         cv.putText(image, "Finger Gesture : " + finger_gesture_text, (10, 60),
-                   cv.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2,
-                   cv.LINE_AA)
-
-    if action_text != "":
-        cv.putText(image, "Action : " + action_text, (10, 100),
-                   cv.FONT_HERSHEY_SIMPLEX, 1.0, (0, 0, 0), 4, cv.LINE_AA)
-        cv.putText(image, "Action : " + action_text, (10, 100),
                    cv.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2,
                    cv.LINE_AA)
 
@@ -617,7 +443,6 @@ def calc_landmark_list(image, landmarks):
     for _, landmark in enumerate(landmarks):
         landmark_x = min(int(landmark.x * image_width), image_width - 1)
         landmark_y = min(int(landmark.y * image_height), image_height - 1)
-        # landmark_z = landmark.z
 
         landmark_point.append([landmark_x, landmark_y])
 
@@ -701,16 +526,19 @@ def draw_bounding_rect(use_brect, image, brect):
 
 
 def get_handedness_label(handedness):
-    """Extract a readable handedness label from MediaPipe Tasks output."""
+    # Extract a readable handedness label from MediaPipe Tasks output
     if not handedness:
-        return "Unknown"
+        return "nknown"
 
     category = handedness[0]
-    return (
+    
+    label = (
         getattr(category, "category_name", None)
         or getattr(category, "display_name", None)
         or "Unknown"
     )
+
+    return label.lower()
 
 
 def draw_point_history(image, point_history):
@@ -839,87 +667,87 @@ def draw_landmarks(image, landmark_point):
 
     # Key Points
     for index, landmark in enumerate(landmark_point):
-        if index == 0:  # 手首1
+        if index == 0:  # Wrist 1
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 1:  # 手首2
+        if index == 1:  # Wrist 2
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 2:  # 親指：付け根
+        if index == 2:  # Thumb：Base
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 3:  # 親指：第1関節
+        if index == 3:  # Thumb：First joint
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 4:  # 親指：指先
+        if index == 4:  # Thumb：Fingertips
             cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 5:  # 人差指：付け根
+        if index == 5:  # Index finger：Base
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 6:  # 人差指：第2関節
+        if index == 6:  # Index finger：Second joint
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 7:  # 人差指：第1関節
+        if index == 7:  # Index finger：First joint
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 8:  # 人差指：指先
+        if index == 8:  # Index finger：Fingertips
             cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 9:  # 中指：付け根
+        if index == 9:  # Middle finger：Base
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 10:  # 中指：第2関節
+        if index == 10:  # Middle finger：Second joint
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 11:  # 中指：第1関節
+        if index == 11:  # Middle finger：First joint
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 12:  # 中指：指先
+        if index == 12:  # Middle finger：Fingertips
             cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 13:  # 薬指：付け根
+        if index == 13:  # Ring finger：Base
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 14:  # 薬指：第2関節
+        if index == 14:  # Ring finger：Second joint
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 15:  # 薬指：第1関節
+        if index == 15:  # Ring finger：First joint
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 16:  # 薬指：指先
+        if index == 16:  # Ring finger：Fingertips
             cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
-        if index == 17:  # 小指：付け根
+        if index == 17:  # Little finger：Base
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 18:  # 小指：第2関節
+        if index == 18:  # Little finger：Second joint
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 19:  # 小指：第1関節
+        if index == 19:  # Little finger：First joint
             cv.circle(image, (landmark[0], landmark[1]), 5, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 5, (0, 0, 0), 1)
-        if index == 20:  # 小指：指先
+        if index == 20:  # Little finger：Fingertips
             cv.circle(image, (landmark[0], landmark[1]), 8, (255, 255, 255),
                       -1)
             cv.circle(image, (landmark[0], landmark[1]), 8, (0, 0, 0), 1)
