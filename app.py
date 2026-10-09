@@ -31,6 +31,11 @@ GESTURE_COOLDOWN = 1.0               # Delay after an action before another one
 
 POINT_HISTORY_LENGTH = 16
 
+# VIDAA configuration
+# Replace these values with your TV network information.
+VIDAA_TV_IP = "192.168.1.XXX"
+VIDAA_TV_MAC = "XX:XX:XX:XX:XX"
+
 class HandState:
     def __init__(self):
         # History used to validate the detected gesture
@@ -49,10 +54,6 @@ class HandState:
         self.candidate_gesture = None
         self.candidate_since = 0.0
 
-# VIDAA configuration
-# Replace these values with your TV network information.
-VIDAA_TV_IP = "192.168.1.286"
-
 def get_args():
     parser = argparse.ArgumentParser()
 
@@ -66,14 +67,13 @@ def get_args():
         default="model/hand_landmarker.task",
     )
 
-    parser.add_argument('--use_static_image_mode', action='store_true')
     parser.add_argument("--min_detection_confidence",
                         help='min_detection_confidence',
                         type=float,
                         default=0.7)
     parser.add_argument("--min_tracking_confidence",
                         help='min_tracking_confidence',
-                        type=int,
+                        type=float,
                         default=0.5)
 
     args = parser.parse_args()
@@ -82,8 +82,9 @@ def get_args():
 
 
 def execute_vidaa_action(action):
+    if action == "Neutral":
+        return True
     ACTION_TO_COMMAND = {
-        "Neutral": "No command",
         "Power": tv.power,
         "Ok": tv.ok,
         "Left": tv.left,
@@ -96,8 +97,7 @@ def execute_vidaa_action(action):
         if command is None:
             print(f"Action inconnue : {action}")
             return False
-        command()
-        return True
+        return bool(command())
     except FileNotFoundError:
         print("Erreur VIDAA : la commande 'tv' est introuvable.")
         return False
@@ -140,7 +140,6 @@ def main():
     cap_width = args.width
     cap_height = args.height
 
-    use_static_image_mode = args.use_static_image_mode
     min_detection_confidence = args.min_detection_confidence
     min_tracking_confidence = args.min_tracking_confidence
 
@@ -313,6 +312,7 @@ def main():
                         keypoint_classifier_labels[hand_sign_id],
                         point_history_classifier_labels[most_common_fg_id[0][0]],
                     )
+                    debug_image = draw_point_history(debug_image, hand_state.point_history)
 
                     if (
                         current_time - hand_state.last_sample_time
@@ -352,6 +352,8 @@ def main():
                                         print(
                                             f"Action VIDAA exécutée : {action}"
                                         )
+                                        if action != "Neutral":
+                                            last_action_time = time.monotonic()
                                     else:
                                         print(
                                             f"Échec de l'action VIDAA : {action}"
@@ -362,6 +364,8 @@ def main():
                                     hand_state.gesture_history.clear()
                                     hand_state.candidate_gesture = None
                                     hand_state.candidate_since = 0.0
+                                    hand_state.point_history.clear()
+                                    hand_state.finger_gesture_history.clear()
                 
             else:
                 # Reset values if no hands are detected
@@ -369,11 +373,9 @@ def main():
                     hand_state.gesture_history.clear()
                     hand_state.candidate_gesture = None
                     hand_state.candidate_since = 0.0
-                current_time = time.monotonic()
-                last_authorization_sample_time = current_time
-                last_gesture_sample_time = current_time
+                    hand_state.point_history.clear()
+                    hand_state.finger_gesture_history.clear()
 
-            debug_image = draw_point_history(debug_image, point_history)
             debug_image = draw_info(debug_image, fps, mode, number)
 
             cv.imshow('Hand Gesture Recognition', debug_image)
@@ -528,14 +530,14 @@ def draw_bounding_rect(use_brect, image, brect):
 def get_handedness_label(handedness):
     # Extract a readable handedness label from MediaPipe Tasks output
     if not handedness:
-        return "nknown"
+        return "unknown"
 
     category = handedness[0]
     
     label = (
         getattr(category, "category_name", None)
         or getattr(category, "display_name", None)
-        or "Unknown"
+        or "unknown"
     )
 
     return label.lower()
